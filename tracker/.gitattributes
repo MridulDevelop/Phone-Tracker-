@@ -4,3 +4,5 @@
 *.cmake linguist-detectable=false
 *.swift linguist-detectable=false
 *.cc linguist-detectable=false
+*.CMakeLists linguist-detectable=false
+CMakeLists.txt linguist-detectable=false
