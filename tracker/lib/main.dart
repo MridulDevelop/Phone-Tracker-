@@ -4,6 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:math';
 import 'dart:async';
 import 'beacon_survice.dart';
+
 void main() {
   runApp(const MyApp());
 }
@@ -11,7 +12,6 @@ void main() {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -21,7 +21,10 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
       darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue, brightness: Brightness.dark,), 
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blue,
+          brightness: Brightness.dark,
+        ),
       ),
       home: const MyHomePage(title: 'Phone Tracker'),
       themeMode: ThemeMode.dark,
@@ -31,7 +34,6 @@ class MyApp extends StatelessWidget {
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
-
   final String title;
 
   @override
@@ -39,90 +41,163 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  
+
+  // ── Subscriptions ──────────────────────────────────────
   StreamSubscription? _scanSubscription;
   StreamSubscription? _bluetoothStateSubscription;
   StreamSubscription? _isScanningSubscription;
 
-double calculateDist(int rssi){
-int measuredPower = -59;
-double environmentalFactor = 2.0;
-num distance = pow(10,((measuredPower - rssi)/(10*environmentalFactor)));
-return distance.toDouble();
-}
-
-List<ScanResult> scanResults = [];
+  // ── State ──────────────────────────────────────────────
+  List<ScanResult> scanResults = [];
   bool isScanning = false;
   bool isAdvertising = false;
-// search
+  ScanResult? pinnedDevice;
+
+  // ── Search ─────────────────────────────────────────────
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = "";
-// pinning
-  ScanResult? pinnedDevice;
- // Filtered search
+
+  // ── Filtered list ──────────────────────────────────────
   List<ScanResult> get filteredResults {
     if (_searchQuery.isEmpty) return scanResults;
     return scanResults.where((r) =>
-      r.device.platformName.toLowerCase()
+      getDeviceLabel(r).toLowerCase()
           .contains(_searchQuery.toLowerCase()) ||
       r.device.remoteId.toString().toLowerCase()
           .contains(_searchQuery.toLowerCase())
     ).toList();
   }
 
+  // ── Distance calculation ───────────────────────────────
+  double calculateDist(int rssi) {
+    int measuredPower = -59;
+    double environmentalFactor = 2.0;
+    num distance = pow(
+      10, ((measuredPower - rssi) / (10 * environmentalFactor))
+    );
+    return distance.toDouble();
+  }
+
+  // ── App device detection ───────────────────────────────
+  // Checks if a scanned device is running your app
+  // by looking for your service UUID FFFE in its advertisement
+  bool isAppDevice(ScanResult result) {
+    return result.advertisementData.serviceUuids
+        .any((uuid) => uuid.toString()
+            .toLowerCase()
+            .contains('fffe'));
+  }
+
+  // ── Device label ───────────────────────────────────────
+  // Returns correct display name for any device type
+  String getDeviceLabel(ScanResult result) {
+    if (isAppDevice(result)) return "📡 App User";
+    if (result.device.platformName.isNotEmpty) {
+      return result.device.platformName;
+    }
+    return result.device.remoteId.toString();
+  }
+
+  // ── Lifecycle ──────────────────────────────────────────
+  @override
+  void initState() {
+    super.initState();
+    bluetoothState();
+    isScanningState();
+  }
+
+  @override
+  void dispose() {
+    FlutterBluePlus.stopScan();
+    _scanSubscription?.cancel();
+    _bluetoothStateSubscription?.cancel();
+    _isScanningSubscription?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  // ── Bluetooth on/off listener ──────────────────────────
+  void bluetoothState() {
+    _bluetoothStateSubscription =
+        FlutterBluePlus.adapterState.listen((BluetoothAdapterState state) async {
+      debugPrint("Bluetooth state: $state");
+      if (state == BluetoothAdapterState.off) {
+        try {
+          await FlutterBluePlus.turnOn();
+        } catch (e) {
+          debugPrint("User refused to turn on Bluetooth: $e");
+        }
+      }
+    });
+  }
+
+  // ── isScanning stream listener ─────────────────────────
+  void isScanningState() {
+    _isScanningSubscription = FlutterBluePlus.isScanning.listen((scanning) {
+      if (mounted) setState(() => isScanning = scanning);
+    });
+  }
+
+  // ── Start scan ─────────────────────────────────────────
   void _startScan() async {
-    // 1. Ask for Android Permissions safely
     Map<Permission, PermissionStatus> statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.location,
     ].request();
-     //At the start of startscan to keep the isScanningSubscription in sync.
-      setState(()=> isScanning = true);
-      await FlutterBluePlus.startScan(continuousUpdates: true);
 
-     if (!mounted) return;
+    // Check mounted after every await
+    if (!mounted) return;
 
-    // 2. If user clicks "Allow", start scanning
-    if (statuses[Permission.bluetoothScan]!.isGranted && 
+    if (statuses[Permission.bluetoothScan]!.isGranted &&
         statuses[Permission.location]!.isGranted) {
-      
-      await _scanSubscription?.cancel(); 
+
+      await _scanSubscription?.cancel();
 
       setState(() {
-        scanResults.clear(); 
-        isScanning = true;
+        scanResults.clear();
+        isScanning = true; // optimistic update
       });
 
-    _scanSubscription = FlutterBluePlus.onScanResults.listen((results){
-        if(!mounted) return;
-        setState(() {
-          scanResults = results.toList();
-           
-           // Keep pinned device RSSI updated in real time
+      _scanSubscription = FlutterBluePlus.onScanResults.listen(
+        (results) {
+          if (!mounted) return;
+
+          // Debug — shows service UUIDs of all detected devices
+          for (var r in results) {
+            if (r.advertisementData.serviceUuids.isNotEmpty) {
+              debugPrint("SCAN: ${r.device.remoteId} → "
+                  "UUIDs: ${r.advertisementData.serviceUuids}");
+            }
+          }
+
+          setState(() {
+            scanResults = results.toList();
+
+            // Keep pinned device RSSI updated in real time
             if (pinnedDevice != null) {
               final updated = results.where((r) =>
-                r.device.remoteId == pinnedDevice!.device.remoteId
-              );
-              if (updated.isNotEmpty) {
-                pinnedDevice = updated.first;
-              }
+                  r.device.remoteId == pinnedDevice!.device.remoteId);
+              if (updated.isNotEmpty) pinnedDevice = updated.first;
             }
           });
-    },
-        onError : (error){
+        },
+        onError: (error) {
           debugPrint("Scan error: $error");
-          if(mounted){
+          if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text("Scan error: $error"),
-              backgroundColor: Colors.red,),
+              SnackBar(
+                content: Text("Scan error: $error"),
+                backgroundColor: Colors.red,
+              ),
             );
           }
-        }); 
-       await FlutterBluePlus.startScan(continuousUpdates: true);
-    }
-    else {
-      //  Show error if permissions denied
+        },
+      );
+
+      await FlutterBluePlus.startScan(continuousUpdates: true);
+
+    } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text("Bluetooth and Location permissions are required!"),
@@ -131,14 +206,16 @@ List<ScanResult> scanResults = [];
       );
     }
   }
+
+  // ── Stop scan ──────────────────────────────────────────
   Future<void> _stopScan() async {
-  await FlutterBluePlus.stopScan();
-  await _scanSubscription?.cancel();
-  _scanSubscription = null;
-  if(mounted) setState(() {});
+    await FlutterBluePlus.stopScan();
+    await _scanSubscription?.cancel();
+    _scanSubscription = null;
+    if (mounted) setState(() {});
   }
 
-// toggle broadcasting
+  // ── Toggle broadcasting ────────────────────────────────
   Future<void> _toggleAdvertising() async {
     if (isAdvertising) {
       await BeaconService.stopAdvertising();
@@ -150,7 +227,7 @@ List<ScanResult> scanResults = [];
         if (!success) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("Broadcasting not supported on this device"),
+              content: Text("Broadcasting failed on this device"),
               backgroundColor: Colors.red,
             ),
           );
@@ -159,62 +236,21 @@ List<ScanResult> scanResults = [];
     }
   }
 
-  @override  //This is the function which call bluetooth permision box at start  
-  void initState(){
-    super.initState();
-    bluetoothState();
-    isScanningState();
-  }
-  @override //This is the function that disposes the _scanSubscription at the end 
-  void dispose(){
-  FlutterBluePlus.stopScan();
-   _scanSubscription?.cancel();
-   _bluetoothStateSubscription?.cancel();
-   _isScanningSubscription?.cancel();
-   _searchController.dispose();
-  super.dispose();
-  }
-
-   void isScanningState(){
-    _isScanningSubscription = FlutterBluePlus.isScanning.listen((scanning){
-      setState((){
-        isScanning = scanning;
-      });
-    });
-   }
-
-   void bluetoothState() {
-   _bluetoothStateSubscription = FlutterBluePlus.adapterState.listen((BluetoothAdapterState state) async {
-    debugPrint("Current Bluetooth State: $state");
-    
-    if (state == BluetoothAdapterState.off) {
-      try {
-        await FlutterBluePlus.turnOn();
-      } catch (e) {
-        debugPrint("User refused to turn on Bluetooth: $e");
-      }
-    } else if (state == BluetoothAdapterState.on) {
-      debugPrint("Bluetooth is ready!");
-    }
-  });
-}
-
-
+  // ── Build ──────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-        // Broadcast toggle lives here — top right
+        title: const Text('Phone Tracker'),
+
+        // Broadcast toggle — top right
         actions: [
           IconButton(
-            tooltip: isAdvertising ? 'Stop Broadcasting' : 'Start Broadcasting',
+            tooltip: isAdvertising
+                ? 'Stop Broadcasting'
+                : 'Start Broadcasting',
             icon: Icon(
               isAdvertising
                   ? Icons.wifi_tethering
@@ -224,7 +260,8 @@ List<ScanResult> scanResults = [];
             onPressed: _toggleAdvertising,
           ),
         ],
-          // Search bar inside AppBar at the bottom
+
+        // Search bar
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(56),
           child: Padding(
@@ -259,7 +296,7 @@ List<ScanResult> scanResults = [];
         ),
       ),
 
-     body:  Column(
+      body: Column(
         children: [
 
           // ── Pinned device card ───────────────────────
@@ -268,12 +305,17 @@ List<ScanResult> scanResults = [];
               margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
               color: Theme.of(context).colorScheme.primaryContainer,
               child: ListTile(
-                leading: const Icon(Icons.location_on, color: Colors.amber),
+                leading: const Icon(
+                  Icons.location_on,
+                  color: Colors.amber,
+                ),
                 title: Text(
-                  pinnedDevice!.device.platformName,
+                  getDeviceLabel(pinnedDevice!),
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
-                subtitle: Text(pinnedDevice!.device.remoteId.toString()),
+                subtitle: Text(
+                  pinnedDevice!.device.remoteId.toString(),
+                ),
                 trailing: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   crossAxisAlignment: CrossAxisAlignment.end,
@@ -284,7 +326,7 @@ List<ScanResult> scanResults = [];
                         fontSize: 16,
                         fontWeight: FontWeight.bold,
                         color: Colors.amber,
-                          ),
+                      ),
                     ),
                     Text(
                       "${pinnedDevice!.rssi} dBm",
@@ -295,59 +337,74 @@ List<ScanResult> scanResults = [];
                     ),
                   ],
                 ),
-                // Tap pinned card to unpin
                 onTap: () => setState(() => pinnedDevice = null),
               ),
             ),
-            // Device List
-           Expanded(child: filteredResults.isEmpty? 
-           Center( child: Text(_searchQuery.isNotEmpty? 'No Devices Match "$_searchQuery"'
-           : "No Devices Found. \nTap the search buuton to scan.",
-            textAlign: TextAlign.center,
-           ),
-           )
-          : ListView.builder(
-              itemCount: filteredResults.length,
-              itemBuilder: (context, index) {
-                final data = filteredResults[index];
-                final isPinned = pinnedDevice?.device.remoteId == data.device.remoteId;
-                double distanceinMeters = calculateDist(data.rssi);
 
-                Color signalColor;
-                if(distanceinMeters < 2.0){
-                  signalColor = Colors.green;
-                } else if (distanceinMeters < 5.0){
-                  signalColor = Colors.yellow;
-                }else{
-                  signalColor = Colors.red;
-                }
+          // ── Device list ──────────────────────────────
+          Expanded(
+            child: filteredResults.isEmpty
+                ? Center(
+                    child: Text(
+                      _searchQuery.isNotEmpty
+                          ? 'No devices match "$_searchQuery"'
+                          : "No devices found.\nTap the search button to scan.",
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: filteredResults.length,
+                    itemBuilder: (context, index) {
+                      final data = filteredResults[index];
+                      final isPinned = pinnedDevice?.device.remoteId ==
+                          data.device.remoteId;
+                      final appDevice = isAppDevice(data);
+                      double distanceInMeters = calculateDist(data.rssi);
 
-                return ListTile(
-                   // Tap to pin or unpin
+                      Color signalColor;
+                      if (distanceInMeters < 2.0) {
+                        signalColor = Colors.green;
+                      } else if (distanceInMeters < 5.0) {
+                        signalColor = Colors.yellow;
+                      } else {
+                        signalColor = Colors.red;
+                      }
+
+                      return ListTile(
                         onTap: () {
                           setState(() {
                             pinnedDevice = isPinned ? null : data;
                           });
                         },
                         leading: Icon(
-                          isPinned ? Icons.push_pin : Icons.bluetooth,
-                          color: isPinned ? Colors.amber : null,
+                          isPinned
+                              ? Icons.push_pin
+                              : appDevice
+                                  ? Icons.smartphone
+                                  : Icons.bluetooth,
+                          color: isPinned
+                              ? Colors.amber
+                              : appDevice
+                                  ? Colors.green
+                                  : null,
                         ),
-                        title: Text(data.device.platformName),
-                        subtitle: Text(data.device.remoteId.toString()),
+                        title: Text(getDeviceLabel(data)),
+                        subtitle: Text(
+                          data.device.remoteId.toString(),
+                        ),
                         trailing: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.end,
                           children: [
                             Text(
-                              "${distanceinMeters.toStringAsFixed(2)}m",
+                              "${distanceInMeters.toStringAsFixed(2)}m",
                               style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 15,
                                 color: signalColor,
                               ),
                             ),
-                              Text(
+                            Text(
                               "${data.rssi} dBm",
                               style: const TextStyle(
                                 fontWeight: FontWeight.bold,
@@ -363,23 +420,23 @@ List<ScanResult> scanResults = [];
           ),
         ],
       ),
-                 
+
+      // ── FAB ───────────────────────────────────────────
       floatingActionButton: FloatingActionButton(
-        onPressed: () async{
-          if(isScanning){
+        onPressed: () async {
+          if (isScanning) {
             await _stopScan();
-          } else{
+          } else {
             _startScan();
           }
         },
-        tooltip: isScanning ? 'Stop Scanning': 'Start Scanning',
+        tooltip: isScanning ? 'Stop Scanning' : 'Start Scanning',
         backgroundColor: isScanning ? Colors.red : Colors.blue,
-
         child: Icon(
           isScanning ? Icons.stop : Icons.search,
           color: Colors.white,
-          ),
         ),
-      );
+      ),
+    );
   }
 }

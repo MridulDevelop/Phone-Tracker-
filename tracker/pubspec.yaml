@@ -35,9 +35,10 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   flutter_blue_plus: ^2.2.1
+  bluetooth_low_energy: ^6.2.1
   permission_handler: ^12.0.1
   shared_preferences: ^2.5.5 #for shared preference in beacon survice.dart file
-  flutter_ble_peripheral: ^2.1.0 
+ 
   
 dev_dependencies:
   flutter_test:

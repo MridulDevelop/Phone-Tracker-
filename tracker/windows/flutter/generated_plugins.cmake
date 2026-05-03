@@ -3,7 +3,7 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
-  flutter_ble_peripheral
+  bluetooth_low_energy_windows
   flutter_blue_plus_winrt
   permission_handler_windows
 )
