@@ -1,11 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:math';
 import 'dart:async';
 import 'beacon_survice.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'login_screen.dart';
+import 'auth_service.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  await GoogleSignIn.instance.initialize();
   runApp(const MyApp());
 }
 
@@ -26,8 +35,12 @@ class MyApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: const MyHomePage(title: 'Phone Tracker'),
       themeMode: ThemeMode.dark,
+
+       // Check if already logged in
+      home: FirebaseAuth.instance.currentUser != null
+          ? const MyHomePage(title: 'Phone Tracker')
+          : const LoginScreen(),
     );
   }
 }
@@ -90,18 +103,48 @@ class _MyHomePageState extends State<MyHomePage> {
 
   // ── Device label ───────────────────────────────────────
   // Returns correct display name for any device type
-  String getDeviceLabel(ScanResult result) {
-    if (isAppDevice(result)) return "📡 App User";
-    if (result.device.platformName.isNotEmpty) {
-      return result.device.platformName;
+ String getDeviceLabel(ScanResult result) {
+  if (isAppDevice(result)) {
+    final advName = result.advertisementData.advName;
+    debugPrint("APP USER: advName='$advName'");
+
+    if (advName.isNotEmpty && advName.contains('#')) {
+      final parts = advName.split('#');
+      final name = parts[0];
+      final code = parts[1];
+      debugPrint("APP USER: name='$name' code='$code'");
+      return "📡 $name";
     }
-    return result.device.remoteId.toString();
+
+    if (advName.isNotEmpty) return "📡 $advName";
+    return "📡 App User";
   }
 
+  if (result.device.platformName.isNotEmpty) {
+    return result.device.platformName;
+  }
+  return result.device.remoteId.toString();
+}
+Future<void> _fixDisplayName() async {
+  final prefs = await SharedPreferences.getInstance();
+  final saved = prefs.getString('display_name');
+  debugPrint("CURRENT SAVED NAME: '$saved'");
+  
+  // If empty or null — load from Firebase Auth
+  if (saved == null || saved.trim().isEmpty) {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user?.displayName != null && user!.displayName!.isNotEmpty) {
+      await BeaconService.setDisplayName(user.displayName!);
+      debugPrint("FIXED: Set name to '${user.displayName}'");
+    }
+  }
+}
   // ── Lifecycle ──────────────────────────────────────────
   @override
   void initState() {
     super.initState();
+    BeaconService.initialize();
+    _fixDisplayName();
     bluetoothState();
     isScanningState();
   }
@@ -259,7 +302,40 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             onPressed: _toggleAdvertising,
           ),
-        ],
+        //Proile sign out button
+IconButton(
+    icon: const Icon(Icons.account_circle),
+    onPressed: () {
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text("Account"),
+          content: Text(
+            "Signed in as:\n${FirebaseAuth.instance.currentUser?.displayName ?? 'Unknown'}\n${FirebaseAuth.instance.currentUser?.email ?? ''}",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Close"),
+            ),
+            TextButton(
+              onPressed: () async {
+                await AuthService.signOut();
+                if (mounted) {
+                  Navigator.pushReplacement(context,MaterialPageRoute(builder: (_) => const LoginScreen(),),);
+                }
+              },
+              child: const Text(
+                "Sign Out",
+                style: TextStyle(color: Colors.red),
+              ),
+            ),
+          ],
+        ),
+      );
+    },
+  ),
+],
 
         // Search bar
         bottom: PreferredSize(

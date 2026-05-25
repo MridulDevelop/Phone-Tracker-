@@ -9,6 +9,7 @@ class BeaconService {
   // Short 16-bit UUID — takes minimum space in advertisement packet
   static const String APP_SERVICE_UUID = 'FFFE';
   static String? _deviceUUID;
+  static String? _displayName;
   static final _peripheral = PeripheralManager();
 
   static Future<String> getDeviceUUID() async {
@@ -23,6 +24,19 @@ class BeaconService {
     return _deviceUUID!;
   }
 
+static Future<void> initialize() async {
+  try{
+     // This triggers PeripheralManager to request its permissions
+    // and transition from unauthorized → poweredOn
+    final state = _peripheral.state;
+    debugPrint("BEACON: Initial Bluetooth state = $state");
+    _peripheral.stateChanged.listen((newState) {
+      debugPrint("BEACON: Bluetooth state changed = $newState");
+    });
+  } catch (e) {
+    debugPrint("BEACON: Initialization error = $e");
+  }
+}
   static String _generateUUID() {
     final random = Random.secure();
     final bytes = List<int>.generate(16, (_) => random.nextInt(256));
@@ -38,27 +52,54 @@ class BeaconService {
         '${hex(bytes[13])}${hex(bytes[14])}${hex(bytes[15])}';
   }
 
-  static Future<bool> startAdvertising() async {
-    // Step 1 — check permission
-    final status = await Permission.bluetoothAdvertise.request();
-    debugPrint("BEACON: Permission = $status");
-    if (!status.isGranted) return false;
+static Future<String> _buildBroadcastName() async {
+  final displayName = await getDisplayName();
+  final deviceUUID = await getDeviceUUID();
+final deviceCode = deviceUUID.replaceAll('-', '').substring(0, 4);
+  // Guard against empty or default name
+  if (displayName.isEmpty || displayName == 'App User') {
+    // Use first 8 chars of UUID as fallback name
+    final fallback = deviceUUID.replaceAll('-', '').substring(0, 8);
+    final broadcastName = '$fallback#$deviceCode';
+    debugPrint("BEACON: No name set — using fallback '$broadcastName'");
+    return broadcastName;
+  }
 
+  // Trim name to max 8 chars
+  final trimmed = displayName.length > 8 
+      ? displayName.substring(0, 8) 
+      : displayName;
+  
+  // Final broadcast name: "Mridul#6d36"
+  final broadcastName = '$trimmed#$deviceCode';
+  debugPrint("BEACON: Broadcast name = '$broadcastName' (${broadcastName.length} chars)");
+  return broadcastName;
+}
+
+ static Future<bool> startAdvertising() async {
+  final status = await Permission.bluetoothAdvertise.request();
+  debugPrint("BEACON: Permission = $status");
+  if (!status.isGranted) return false;
+
+  // Build broadcast name once before retry loop
+  final broadcastName = await _buildBroadcastName();
+  debugPrint("BEACON: Broadcasting as '$broadcastName'");
+
+  for (int attempt = 1; attempt <= 5; attempt++) {
     try {
-      // Step 2 — check bluetooth state properly
-      // .state is a Stream so we listen to first value
-      final currentState =  _peripheral.state;
-      debugPrint("BEACON: BT State = $currentState");
-      
+      final currentState = _peripheral.state;
+      debugPrint("BEACON: Attempt $attempt state = $currentState");
+
       if (currentState != BluetoothLowEnergyState.poweredOn) {
-        debugPrint("BEACON: Bluetooth not ready");
-        return false;
+        debugPrint("BEACON: Not ready, waiting...");
+        await Future.delayed(const Duration(milliseconds: 1000));
+        continue;
       }
 
-      // Step 3 — advertise with SHORT UUID only
-      // No manufacturer data — keeps packet small to avoid error code 3
+      // Single Advertisement object inside loop after state check passes
       final advertisement = Advertisement(
         serviceUUIDs: [UUID.fromString(APP_SERVICE_UUID)],
+        name: broadcastName,
       );
 
       await _peripheral.startAdvertising(advertisement);
@@ -66,10 +107,37 @@ class BeaconService {
       return true;
 
     } catch (e) {
-      debugPrint("BEACON: Failed = $e");
-      return false;
+      debugPrint("BEACON: Attempt $attempt failed = $e");
+      if (attempt < 5) {
+        await Future.delayed(const Duration(milliseconds: 1000));
+      }
     }
   }
+
+  debugPrint("BEACON: All attempts failed");
+  return false;
+}
+
+  static Future<void> setDisplayName(String name) async {
+  // Guard against empty names
+  if (name.trim().isEmpty) {
+    debugPrint("BEACON: Refused to save empty display name");
+    return; // don't save empty strings
+  }
+  _displayName = name.trim();
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString('display_name', name.trim());
+  debugPrint("BEACON: Display name set to '$name'");
+}
+
+static Future<String> getDisplayName() async {
+  if (_displayName != null && _displayName!.isNotEmpty) return _displayName!;
+  final prefs = await SharedPreferences.getInstance();
+  final saved = prefs.getString('display_name');
+  if (saved != null && saved.trim().isNotEmpty) return saved;
+   final uuid = await getDeviceUUID();
+  return "User-${uuid.substring(0,8)}";
+}
 
   static Future<void> stopAdvertising() async {
     try {

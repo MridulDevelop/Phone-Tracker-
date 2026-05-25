@@ -4,6 +4,9 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   bluetooth_low_energy_windows
+  cloud_firestore
+  firebase_auth
+  firebase_core
   flutter_blue_plus_winrt
   permission_handler_windows
 )
