@@ -66,6 +66,8 @@ class _MyHomePageState extends State<MyHomePage> {
   bool isAdvertising = false;
   ScanResult? pinnedDevice;
 
+// ── Track last alert time to avoid spamming─────────────────────────────────────────────
+DateTime? _lastAlertTime;
   // ── Search ─────────────────────────────────────────────
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = "";
@@ -125,6 +127,30 @@ class _MyHomePageState extends State<MyHomePage> {
   }
   return result.device.remoteId.toString();
 }
+
+void _checkProximityAlert(ScanResult result) {
+    final distance = calculateDist(result.rssi);
+    final now = DateTime.now();
+
+    if (distance > 5.0) {
+      if (_lastAlertTime == null ||
+          now.difference(_lastAlertTime!).inSeconds > 10) {
+        _lastAlertTime = now;
+        final name = getDeviceLabel(result); // FIX 3: was 'device', now 'result'
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              "⚠️ $name is moving away — ${distance.toStringAsFixed(1)}m"
+            ),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+  
 Future<void> _fixDisplayName() async {
   final prefs = await SharedPreferences.getInstance();
   final saved = prefs.getString('display_name');
@@ -188,7 +214,6 @@ Future<void> _fixDisplayName() async {
       Permission.bluetoothConnect,
       Permission.location,
     ].request();
-
     // Check mounted after every await
     if (!mounted) return;
 
@@ -221,7 +246,10 @@ Future<void> _fixDisplayName() async {
             if (pinnedDevice != null) {
               final updated = results.where((r) =>
                   r.device.remoteId == pinnedDevice!.device.remoteId);
-              if (updated.isNotEmpty) pinnedDevice = updated.first;
+              if (updated.isNotEmpty) {
+                pinnedDevice = updated.first;
+              _checkProximityAlert(pinnedDevice!);
+              }
             }
           });
         },
@@ -416,7 +444,7 @@ IconButton(
                 onTap: () => setState(() => pinnedDevice = null),
               ),
             ),
-
+           
           // ── Device list ──────────────────────────────
           Expanded(
             child: filteredResults.isEmpty
