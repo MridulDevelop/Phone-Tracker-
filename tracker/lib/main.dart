@@ -10,6 +10,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'login_screen.dart';
 import 'auth_service.dart';
+import 'last_seen_screen.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -53,8 +55,7 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-
+class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver{
   // ── Subscriptions ──────────────────────────────────────
   StreamSubscription? _scanSubscription;
   StreamSubscription? _bluetoothStateSubscription;
@@ -92,6 +93,22 @@ DateTime? _lastAlertTime;
     );
     return distance.toDouble();
   }
+   
+   String getProximityZone(double distance) {
+  if (distance < 1.5) return "Right Here";
+  if (distance < 3.0) return "Very Close";
+  if (distance < 6.0) return "Nearby";
+  if (distance < 12.0) return "Getting Far";
+  return "Far Away";
+}
+
+Color getZoneColor(double distance) {
+  if (distance < 1.5) return Colors.green;
+  if (distance < 3.0) return Colors.lightGreen;
+  if (distance < 6.0) return Colors.yellow;
+  if (distance < 12.0) return Colors.orange;
+  return Colors.red;
+}
 
   // ── App device detection ───────────────────────────────
   // Checks if a scanned device is running your app
@@ -173,6 +190,7 @@ Future<void> _fixDisplayName() async {
     _fixDisplayName();
     bluetoothState();
     isScanningState();
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
@@ -183,6 +201,7 @@ Future<void> _fixDisplayName() async {
     _isScanningSubscription?.cancel();
     _searchController.dispose();
     super.dispose();
+    WidgetsBinding.instance.removeObserver(this);
   }
 
   // ── Bluetooth on/off listener ──────────────────────────
@@ -208,18 +227,22 @@ Future<void> _fixDisplayName() async {
   }
 
   // ── Start scan ─────────────────────────────────────────
-  void _startScan() async {
+  Future<void> _startScan() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.location,
     ].request();
+    
     // Check mounted after every await
     if (!mounted) return;
 
-    if (statuses[Permission.bluetoothScan]!.isGranted &&
-        statuses[Permission.location]!.isGranted) {
+    // THE FIX: Enforcing bluetoothConnect. Without this, Android 12+ crashes the app.
+    final bool isScanGranted = statuses[Permission.bluetoothScan]?.isGranted ?? false;
+    final bool isConnectGranted = statuses[Permission.bluetoothConnect]?.isGranted ?? false;
+    final bool isLocationGranted = statuses[Permission.location]?.isGranted ?? false;
 
+    if (isScanGranted && isConnectGranted && isLocationGranted) {
       await _scanSubscription?.cancel();
 
       setState(() {
@@ -231,24 +254,22 @@ Future<void> _fixDisplayName() async {
         (results) {
           if (!mounted) return;
 
-          // Debug — shows service UUIDs of all detected devices
-          for (var r in results) {
-            if (r.advertisementData.serviceUuids.isNotEmpty) {
-              debugPrint("SCAN: ${r.device.remoteId} → "
-                  "UUIDs: ${r.advertisementData.serviceUuids}");
-            }
-          }
+          // Debug print removed for production cleanliness
 
           setState(() {
             scanResults = results.toList();
-
+          for (var r in results) {
+          if (isAppDevice(r)) {
+             _logDetection(r); // log every app user detected
+            }
+           }
             // Keep pinned device RSSI updated in real time
             if (pinnedDevice != null) {
               final updated = results.where((r) =>
                   r.device.remoteId == pinnedDevice!.device.remoteId);
               if (updated.isNotEmpty) {
                 pinnedDevice = updated.first;
-              _checkProximityAlert(pinnedDevice!);
+                _checkProximityAlert(pinnedDevice!);
               }
             }
           });
@@ -266,18 +287,33 @@ Future<void> _fixDisplayName() async {
         },
       );
 
-      await FlutterBluePlus.startScan(continuousUpdates: true);
-
+      // THE FIX: Wrapping the native call in try-catch prevents PlatformExceptions 
+      // from crashing the app if Bluetooth is off or the adapter is busy.
+      try {
+        await FlutterBluePlus.startScan(continuousUpdates: true);
+      } catch (e) {
+        debugPrint("Start scan failed: $e");
+        setState(() {
+          isScanning = false;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Could not start scan. Is Bluetooth turned on?"),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Bluetooth and Location permissions are required!"),
+          content: Text("Bluetooth (Scan & Connect) and Location permissions are required!"),
           backgroundColor: Colors.red,
         ),
       );
     }
   }
-
   // ── Stop scan ──────────────────────────────────────────
   Future<void> _stopScan() async {
     await FlutterBluePlus.stopScan();
@@ -307,6 +343,87 @@ Future<void> _fixDisplayName() async {
     }
   }
 
+@override
+void didChangeAppLifecycleState(AppLifecycleState state) {
+  super.didChangeAppLifecycleState(state);
+  if (state == AppLifecycleState.paused ||
+      state == AppLifecycleState.detached) {
+    _updateLastSeenOnClose();
+  }
+}
+
+Future<void> _updateLastSeenOnClose() async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) return;
+
+  try {
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(currentUser.uid)
+        .update({
+          'lastActive': FieldValue.serverTimestamp(),
+          'lastActiveZone': 'Offline',
+        });
+
+    for (var result in scanResults) {
+      if (isAppDevice(result)) {
+        final name = getDeviceLabel(result).replaceAll('📡 ', '');
+        await FirebaseFirestore.instance
+            .collection('lastSeen')
+            .doc(name)
+            .set({
+              'name': name,
+              'lastSeenBy': currentUser.displayName ?? 'Unknown',
+              'zone': getProximityZone(calculateDist(result.rssi)),
+              'rssi': result.rssi,
+              'timestamp': FieldValue.serverTimestamp(),
+              'appClosed': true,
+            }, SetOptions(merge: true));
+      }
+    }
+  } catch (e) {
+    debugPrint("Close update error: $e");
+  }
+}
+final Map<String, DateTime> _lastLogTime = {};
+// Log detection to Firestore
+Future<void> _logDetection(ScanResult result) async {
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) return;
+
+    final detectedName = getDeviceLabel(result)
+        .replaceAll('📡', '').trim(); 
+    final now = DateTime.now();
+    //only log once per 60 seconds per device
+    if(_lastLogTime.containsKey(detectedName)){
+    if(now.difference(_lastLogTime[detectedName]!).inSeconds < 60) return ;
+    }
+    _lastLogTime[detectedName] = now;
+    
+    try{
+      final data = {
+        'detectedName': detectedName,
+          'detectedBy': currentUser.displayName ?? 'Unknown',
+          'detectedByUid': currentUser.uid,
+          'rssi': result.rssi,
+          'zone': getProximityZone(calculateDist(result.rssi)),
+          'timestamp': FieldValue.serverTimestamp(),
+      };
+    await FirebaseFirestore.instance
+        .collection('detections')
+        .add(data);
+    // lastSeen document for quick lookup
+    await FirebaseFirestore.instance
+        .collection('lastSeen')
+        .doc(detectedName)
+        .set({...data,
+        'appClosed': false,
+    }, SetOptions(merge: true));
+
+  } catch (e) {
+    debugPrint("Detection log error: $e");
+  }
+}
   // ── Build ──────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
@@ -363,6 +480,19 @@ IconButton(
       );
     },
   ),
+
+  IconButton(
+  icon: const Icon(Icons.history),
+  tooltip: 'Last Seen',
+  onPressed: () {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const LastSeenScreen(),
+      ),
+    );
+  },
+),
 ],
 
         // Search bar
@@ -421,6 +551,7 @@ IconButton(
                   pinnedDevice!.device.remoteId.toString(),
                 ),
                 trailing: Column(
+                  mainAxisSize: MainAxisSize.min,
                   mainAxisAlignment: MainAxisAlignment.center,
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
@@ -463,16 +594,6 @@ IconButton(
                       final isPinned = pinnedDevice?.device.remoteId ==
                           data.device.remoteId;
                       final appDevice = isAppDevice(data);
-                      double distanceInMeters = calculateDist(data.rssi);
-
-                      Color signalColor;
-                      if (distanceInMeters < 2.0) {
-                        signalColor = Colors.green;
-                      } else if (distanceInMeters < 5.0) {
-                        signalColor = Colors.yellow;
-                      } else {
-                        signalColor = Colors.red;
-                      }
 
                       return ListTile(
                         onTap: () {
@@ -496,28 +617,42 @@ IconButton(
                         subtitle: Text(
                           data.device.remoteId.toString(),
                         ),
-                        trailing: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              "${distanceInMeters.toStringAsFixed(2)}m",
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 15,
-                                color: signalColor,
-                              ),
-                            ),
-                            Text(
-                              "${data.rssi} dBm",
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 10,
-                                color: Colors.teal,
-                              ),
-                            ),
-                          ],
-                        ),
+                     
+                  trailing: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(
+                      // 1. Safe text rendering
+                      getProximityZone(calculateDist(data.rssi)), 
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        // 2. Safe color rendering
+                        color:getZoneColor(calculateDist(data.rssi))
+                      ),
+                    ),
+                    Text(
+                      "${calculateDist(data.rssi).toStringAsFixed(1)}m",
+                          
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: pinnedDevice != null ? Colors.teal : Colors.grey,
+                      ),
+                    ),
+                    Text(
+                      "${data.rssi} dBm",
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: pinnedDevice != null ? Colors.teal : Colors.grey,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
                       );
                     },
                   ),
